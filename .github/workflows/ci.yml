@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        go: ['1.24.x', stable]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: gofmt
+        run: |
+          gofmt -l .
+          test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race -short ./...
+      - name: Tests the race build excludes
+        run: go test -short -run ConcurrentSrcMutation ./...
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.24.x', stable]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Module has no requirements
+        run: test "$(go list -m all)" = github.com/finlleyl/hnsw
+      - name: Build every platform
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "$target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build ./...
+          done
