@@ -1,0 +1,2 @@
+# Keep bytes as committed so gofmt checks and golden files behave the same on Windows.
+* -text
