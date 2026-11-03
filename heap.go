@@ -11,6 +11,17 @@ func (x item) less(y item) bool {
 	return x.dist < y.dist || (x.dist == y.dist && x.id < y.id)
 }
 
+// compareItems is less as a three-way comparison, for sorting.
+func compareItems(x, y item) int {
+	switch {
+	case x.less(y):
+		return -1
+	case y.less(x):
+		return 1
+	}
+	return 0
+}
+
 // minHeap pops the smallest item first. It allocates only when append grows it.
 type minHeap []item
 

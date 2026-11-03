@@ -50,7 +50,7 @@ jobs:
         run: test "$(go list -m all)" = github.com/finlleyl/hnsw
       - name: Build every platform
         run: |
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+          for target in linux/amd64 linux/arm64 linux/386 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             echo "$target"
             GOOS="${target%/*}" GOARCH="${target#*/}" go build ./...
           done
