@@ -13,13 +13,15 @@ const (
 type graph[K Key] struct {
 	dim, m         int // immutable; layer 0 holds up to 2m links
 	n, live, entry uint32
+	deadN          uint32 // tombstoned nodes, so live == n - deadN
 	top            uint8
 	vecs           [][]float32 // chunks of chunkSize vectors; chunk 0 doubles until full
 	adj0           []uint32    // n records of 2m+1 words: count, then links, unused slots zero
 	up             []uint32    // upper records of m+1 words, appended in node-ID order
 	upOff          []uint32    // index of a node's first upper record, valid when level > 0
 	level          []uint8
-	keys           []K
+	dead           []uint64 // tombstone bitset
+	keys           []K      // primary key per node; zero value when dead
 	byKey          map[K]uint32
 }
 
@@ -31,6 +33,18 @@ func (g *graph[K]) vec(id uint32) []float32 {
 	c := g.vecs[id>>chunkShift]
 	i := int(id&(chunkSize-1)) * g.dim
 	return c[i : i+g.dim : i+g.dim]
+}
+
+func (g *graph[K]) isDead(id uint32) bool { return g.dead[id/64]&(1<<(id%64)) != 0 }
+
+// kill tombstones a live node. Its links stay, so no edge can dangle and searches still
+// walk through it. byKey is the caller's to update.
+func (g *graph[K]) kill(id uint32) {
+	g.dead[id/64] |= 1 << (id % 64)
+	var zero K
+	g.keys[id] = zero
+	g.live--
+	g.deadN++
 }
 
 // vecAt is vec, except that pending, a node being inserted, maps to its unstored vector q.
@@ -79,13 +93,17 @@ type patch struct {
 }
 
 // publish stores a planned node: its vector from w.q, its key, and every list in
-// w.patches, including the node's own.
-func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int) {
+// w.patches, including the node's own. A replaced node, old, is tombstoned in the same
+// step; noEntry means none.
+func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int, old uint32) {
 	g.appendVec(w.q)
 	g.level = append(g.level, uint8(lv))
 	g.upOff = append(g.upOff, uint32(g.records()))
 	g.up = append(g.up, make([]uint32, lv*(g.m+1))...)
 	g.adj0 = append(g.adj0, make([]uint32, 2*g.m+1)...)
+	if id%64 == 0 {
+		g.dead = append(g.dead, 0)
+	}
 	g.keys = append(g.keys, key)
 	g.byKey[key] = id
 	for _, p := range w.patches {
@@ -98,6 +116,9 @@ func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int) {
 	}
 	g.n++
 	g.live++
+	if old != noEntry {
+		g.kill(old)
+	}
 }
 
 func (g *graph[K]) appendVec(v []float32) {

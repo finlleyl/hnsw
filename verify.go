@@ -3,6 +3,7 @@ package hnsw
 import (
 	"fmt"
 	"math"
+	"math/bits"
 )
 
 // verify checks the graph invariants and returns the first violation, wrapping ErrCorrupt.
@@ -17,6 +18,9 @@ func (g *graph[K]) verify() error {
 	}
 	if len(g.level) != n || len(g.upOff) != n || len(g.keys) != n || len(g.adj0) != n*(2*g.m+1) {
 		return bad("array lengths do not match %d nodes", n)
+	}
+	if len(g.dead) != (n+63)/64 {
+		return bad("%d tombstone words for %d nodes", len(g.dead), n)
 	}
 	if len(g.vecs) != (n+chunkSize-1)/chunkSize {
 		return bad("%d vector chunks for %d nodes", len(g.vecs), n)
@@ -45,6 +49,30 @@ func (g *graph[K]) verify() error {
 	}
 	if int64(records) > maxRecords || len(g.up) != records*(g.m+1) {
 		return bad("%d upper words for %d records", len(g.up), records)
+	}
+	// I9 and the single-key part of I5 and I6: counts, tombstones and keys.
+	deadN := 0
+	for i, w := range g.dead {
+		if i == len(g.dead)-1 && n%64 != 0 && w>>(n%64) != 0 {
+			return bad("tombstone bits set past node %d", n)
+		}
+		deadN += bits.OnesCount64(w)
+	}
+	if deadN != int(g.deadN) || g.live != g.n-g.deadN {
+		return bad("live %d, deleted %d, but %d of %d nodes are tombstones", g.live, g.deadN, deadN, n)
+	}
+	if len(g.byKey) != int(g.live) {
+		return bad("%d keys for %d live nodes", len(g.byKey), g.live)
+	}
+	var zero K
+	for id := range g.n {
+		if g.isDead(id) {
+			if g.keys[id] != zero {
+				return bad("tombstone %d holds a key", id)
+			}
+		} else if got, ok := g.byKey[g.keys[id]]; !ok || got != id {
+			return bad("node %d key maps to %d", id, got)
+		}
 	}
 	// I1-I3: links.
 	var seen visited
@@ -91,26 +119,33 @@ func (g *graph[K]) verify() error {
 	return nil
 }
 
-// unreached counts nodes that a walk over layer-0 links from the entry misses. It is a
-// quality measure, not an invariant: directed edges do not guarantee reachability.
+// unreached counts live nodes that a walk over layer-0 links from the entry misses. It is
+// a quality measure, not an invariant: directed edges do not guarantee reachability.
 func (g *graph[K]) unreached() int {
 	if g.n == 0 {
 		return 0
 	}
+	missed := int(g.live)
+	for _, id := range g.reach(g.entry) {
+		if !g.isDead(id) {
+			missed--
+		}
+	}
+	return missed
+}
+
+// reach returns the nodes a walk over layer-0 links from id visits, tombstones included.
+func (g *graph[K]) reach(id uint32) []uint32 {
 	var seen visited
 	seen.reset(int(g.n))
-	seen.visit(g.entry)
-	stack := []uint32{g.entry}
-	reached := 1
-	for len(stack) > 0 {
-		id := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		for _, e := range g.list(id, 0) {
+	seen.visit(id)
+	out := []uint32{id}
+	for i := 0; i < len(out); i++ {
+		for _, e := range g.list(out[i], 0) {
 			if seen.visit(e) {
-				reached++
-				stack = append(stack, e)
+				out = append(out, e)
 			}
 		}
 	}
-	return int(g.n) - reached
+	return out
 }

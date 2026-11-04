@@ -33,10 +33,15 @@ type searchState struct {
 
 func distance(a, b []float32) float32 { return 1 - dot(a, b) }
 
+// deadBudget bounds the tombstones one search may expand, so a mostly deleted index
+// cannot hold a search for long. It is a variable only so tests can lower it.
+var deadBudget = 65536
+
 // Search returns up to k results, nearest first, 1 <= k <= 65536. It returns fewer than
-// k if the index holds fewer keys or a node is unreachable. An empty index returns
-// nil, nil. Tie order is unspecified. Errors: ErrDimension, ErrInvalidVector,
-// ErrInvalidArgument.
+// k if the index holds fewer keys, if a key is unreachable, or if the tombstone walk
+// budget ran out (Stats.BudgetStops counts this). An empty index returns nil, nil. Tie
+// order is unspecified. Allocation is bounded by live keys, not by k. Errors:
+// ErrDimension, ErrInvalidVector, ErrInvalidArgument.
 func (ix *Index[K]) Search(query []float32, k int, o SearchOptions) ([]Result[K], error) {
 	g := ix.g
 	if g == nil {
@@ -64,15 +69,10 @@ func (ix *Index[K]) Search(query []float32, k int, o SearchOptions) ([]Result[K]
 	if g.live == 0 {
 		return nil, nil
 	}
-	q := st.q
-	ep := item{distance(q, g.vec(g.entry)), g.entry}
-	for layer := int(g.top); layer > 0; layer-- {
-		ep = g.searchLayer(st, q, ep, 1, layer)
+	found, _, stopped := g.search(st, st.q, k, ef)
+	if stopped {
+		ix.budgetStops.Add(1)
 	}
-	// Once every live node is in W the beam is full and the normal stop rule applies.
-	g.searchLayer(st, q, ep, min(max(ef, k), int(g.live)), 0)
-	found := st.sortedW()
-	found = found[:min(k, len(found))]
 	out := make([]Result[K], len(found))
 	for i, x := range found {
 		out[i] = Result[K]{g.keys[x.id], max(0, x.dist)}
@@ -80,18 +80,42 @@ func (ix *Index[K]) Search(query []float32, k int, o SearchOptions) ([]Result[K]
 	return out, nil
 }
 
+// search is Algorithm 5 on a normalized query with at least one live key. It returns the
+// k nearest live nodes found, the layer-0 node the descent landed on, and whether the
+// tombstone budget stopped the search.
+func (g *graph[K]) search(st *searchState, q []float32, k, ef int) (found []item, landing uint32, stopped bool) {
+	ep := item{distance(q, g.vec(g.entry)), g.entry}
+	for layer := int(g.top); layer > 0; layer-- {
+		ep, _ = g.searchLayer(st, q, ep, 1, layer, false)
+	}
+	// Once every live node is in W the beam is full and the normal stop rule applies.
+	_, stopped = g.searchLayer(st, q, ep, min(max(ef, k), int(g.live)), 0, true)
+	found = st.sortedW()
+	return found[:min(k, len(found))], ep.id, stopped
+}
+
 // searchLayer is Algorithm 2. It leaves the ef nearest nodes found in st.w and returns
-// the nearest.
-func (g *graph[K]) searchLayer(st *searchState, q []float32, ep item, ef, layer int) item {
+// the nearest. Tombstones are ordinary nodes unless filter is set: then they are walked
+// but never enter W, and expanding more than deadBudget of them stops the search.
+func (g *graph[K]) searchLayer(st *searchState, q []float32, ep item, ef, layer int, filter bool) (nearest item, stopped bool) {
 	st.vis.reset(int(g.n))
 	st.vis.visit(ep.id)
 	st.cand = append(st.cand[:0], ep)
-	st.w = append(st.w[:0], ep)
-	nearest := ep
+	st.w = st.w[:0]
+	if !filter || !g.isDead(ep.id) {
+		st.w = append(st.w, ep)
+	}
+	nearest = ep
+	deadPops := 0
 	for len(st.cand) > 0 {
 		c := st.cand.pop()
 		if len(st.w) >= ef && c.dist > st.w[0].dist {
 			break
+		}
+		if filter && g.isDead(c.id) {
+			if deadPops++; deadPops > deadBudget {
+				return nearest, true
+			}
 		}
 		for _, e := range g.list(c.id, layer) {
 			if !st.vis.visit(e) {
@@ -100,6 +124,9 @@ func (g *graph[K]) searchLayer(st *searchState, q []float32, ep item, ef, layer 
 			x := item{distance(q, g.vec(e)), e}
 			if len(st.w) < ef || x.dist < st.w[0].dist {
 				st.cand.push(x)
+				if filter && g.isDead(e) {
+					continue
+				}
 				st.w.push(x)
 				if len(st.w) > ef {
 					st.w.pop()
@@ -110,7 +137,7 @@ func (g *graph[K]) searchLayer(st *searchState, q []float32, ep item, ef, layer 
 			}
 		}
 	}
-	return nearest
+	return nearest, false
 }
 
 // sortedW empties W into st.sorted in (distance, ID) order.

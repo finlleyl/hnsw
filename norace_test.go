@@ -8,6 +8,8 @@ import (
 	"testing"
 )
 
+const raceEnabled = false
+
 //go:noinline
 func storeFloat32(p *float32, x float32) { *p = x }
 

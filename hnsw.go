@@ -3,9 +3,13 @@ package hnsw
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"math"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Errors returned by this package. Match them with errors.Is; they are wrapped with detail.
@@ -45,16 +49,23 @@ const (
 	maxBeam = 65536 // cap on k, Ef and EfConstruction
 )
 
-// Index is an approximate nearest neighbour index. Searches may run concurrently with
-// each other, but Add must not run concurrently with any other method.
+// maxKeyBytes is the longest string key, because the file format stores a u32 length.
+// It is a variable only so tests can lower it.
+var maxKeyBytes uint64 = 1<<32 - 1
+
+// Index is an approximate nearest neighbour index. Searches, Contains, Len, Keys and
+// Stats may run concurrently with each other, but Add and Delete must not run
+// concurrently with any other method.
 type Index[K Key] struct {
-	g    *graph[K]
-	pool sync.Pool   // *searchState for Search
-	w    searchState // writer scratch for Add
-	efc  int         // immutable after New, like the fields below
-	ef   int
-	ml   float64 // level multiplier 1/ln(M)
-	seed uint64
+	g           *graph[K]
+	pool        sync.Pool   // *searchState for Search
+	w           searchState // writer scratch for Add
+	budgetStops atomic.Uint64
+	efc         int // immutable after New, like the fields below
+	ef          int
+	ml          float64 // level multiplier 1/ln(M)
+	seed        uint64
+	stringKey   bool // K's underlying type is string
 }
 
 // New validates everything up front. dim is fixed for the life of the index, 1..65536.
@@ -88,14 +99,17 @@ func New[K Key](dim int, o Options) (*Index[K], error) {
 		ef:   o.Ef,
 		ml:   1 / math.Log(float64(o.M)),
 		seed: o.Seed,
+		// string(k) does not compile for a union with ~[16]byte, and unsafe is not used.
+		stringKey: reflect.TypeFor[K]().Kind() == reflect.String,
 	}
 	ix.pool.New = func() any { return new(searchState) }
 	return ix, nil
 }
 
-// Add inserts key with a copy of vector, validated and normalized. On error the index is
-// unchanged. Errors: ErrDimension, ErrInvalidVector (NaN, Inf, zero), ErrFull,
-// ErrInvalidArgument (zero Index, key already present).
+// Add inserts or replaces key. The vector is validated, copied and normalized. Same key
+// and same vector is a no-op, so replay is idempotent. On error the index is unchanged.
+// Errors: ErrDimension, ErrInvalidVector (NaN, Inf, zero), ErrFull, ErrInvalidArgument
+// (zero Index, string key over 2^32-1 bytes).
 func (ix *Index[K]) Add(key K, vector []float32) error {
 	g := ix.g
 	if g == nil {
@@ -109,9 +123,19 @@ func (ix *Index[K]) Add(key K, vector []float32) error {
 	if err := normalize(w.q, vector); err != nil {
 		return err
 	}
-	// shortcut: an existing key is rejected, not replaced; upsert replaces this check.
-	if _, ok := g.byKey[key]; ok {
-		return fmt.Errorf("%w: key already present", ErrInvalidArgument)
+	old, exists := g.byKey[key]
+	if exists {
+		// Normalized vectors hold no NaN or -0, so == is bit equality here.
+		if slices.Equal(g.vec(old), w.q) {
+			return nil
+		}
+		key = g.keys[old] // already owned
+	} else {
+		var err error
+		if key, err = ix.ownKey(key); err != nil {
+			return err
+		}
+		old = noEntry
 	}
 	if g.n >= maxNodes {
 		return fmt.Errorf("%w: %d nodes", ErrFull, g.n)
@@ -122,8 +146,85 @@ func (ix *Index[K]) Add(key K, vector []float32) error {
 		return fmt.Errorf("%w: upper-layer records", ErrFull)
 	}
 	ix.plan(id, lv)
-	g.publish(key, w, id, lv)
+	g.publish(key, w, id, lv, old)
 	return nil
+}
+
+// ownKey copies a string key, so a substring cannot pin the caller's larger buffer, and
+// rejects one too long to save.
+func (ix *Index[K]) ownKey(key K) (K, error) {
+	if !ix.stringKey {
+		return key, nil
+	}
+	v := reflect.ValueOf(&key).Elem()
+	if uint64(v.Len()) > maxKeyBytes {
+		return key, fmt.Errorf("%w: string key of %d bytes", ErrInvalidArgument, v.Len())
+	}
+	v.SetString(strings.Clone(v.String()))
+	return key, nil
+}
+
+// Delete removes key and reports whether it existed. The node stays in the graph as a
+// tombstone that searches walk through, so its embedding stays in memory.
+func (ix *Index[K]) Delete(key K) bool {
+	g := ix.g
+	if g == nil {
+		return false
+	}
+	id, ok := g.byKey[key]
+	if !ok {
+		return false
+	}
+	delete(g.byKey, key)
+	g.kill(id)
+	return true
+}
+
+// Contains reports whether key is in the index.
+func (ix *Index[K]) Contains(key K) bool {
+	if ix.g == nil {
+		return false
+	}
+	_, ok := ix.g.byKey[key]
+	return ok
+}
+
+// Keys iterates over the keys. The loop body may call any method. A key not changed
+// during iteration appears exactly once; keys added, deleted or replaced meanwhile may
+// appear, repeat or be missed.
+func (ix *Index[K]) Keys() iter.Seq[K] {
+	return func(yield func(K) bool) {
+		g := ix.g
+		if g == nil {
+			return
+		}
+		for id := uint32(0); id < g.n; id++ { // g.n is reread, since the body may Add
+			if !g.isDead(id) && !yield(g.keys[id]) {
+				return
+			}
+		}
+	}
+}
+
+// Stats describes the index. Fields will only be added.
+type Stats struct {
+	Dim, Keys, Nodes, Deleted, MaxLevel int    // Deleted counts tombstoned nodes
+	BudgetStops                         uint64 // searches cut short by the tombstone walk budget
+}
+
+func (ix *Index[K]) Stats() Stats {
+	g := ix.g
+	if g == nil {
+		return Stats{}
+	}
+	return Stats{
+		Dim:         g.dim,
+		Keys:        int(g.live),
+		Nodes:       int(g.n),
+		Deleted:     int(g.deadN),
+		MaxLevel:    int(g.top),
+		BudgetStops: ix.budgetStops.Load(),
+	}
 }
 
 // levelOf draws a node's top layer, min(floor(-ln(u)*mL), 31). u comes from a hash of the
@@ -153,10 +254,10 @@ func (ix *Index[K]) plan(id uint32, lv int) {
 	q := w.q
 	ep := item{distance(q, g.vec(g.entry)), g.entry}
 	for layer := int(g.top); layer > lv; layer-- {
-		ep = g.searchLayer(w, q, ep, 1, layer)
+		ep, _ = g.searchLayer(w, q, ep, 1, layer, false)
 	}
 	for layer := min(int(g.top), lv); layer >= 0; layer-- {
-		g.searchLayer(w, q, ep, ix.efc, layer)
+		g.searchLayer(w, q, ep, ix.efc, layer, false)
 		cands := w.sortedW()
 		ep = cands[0]
 		w.sel = g.selectNeighbors(w.sel, cands, g.m, id, q)

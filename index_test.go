@@ -120,6 +120,15 @@ func build(t *testing.T, vecs [][]float32, o Options) *Index[int] {
 	return ix
 }
 
+// skipUnderRace skips a slow test that runs in one goroutine, where the race detector
+// finds nothing; CI runs it in the non-race step.
+func skipUnderRace(t *testing.T) {
+	t.Helper()
+	if raceEnabled {
+		t.Skip("one goroutine: runs without -race")
+	}
+}
+
 func checkGraph(t *testing.T, ix *Index[int]) {
 	t.Helper()
 	if err := ix.g.verify(); err != nil {
@@ -131,6 +140,7 @@ func checkGraph(t *testing.T, ix *Index[int]) {
 }
 
 func TestRecallClustered(t *testing.T) {
+	skipUnderRace(t)
 	const n, nq, d, k = 20000, 1000, 128, 10
 	all := clustered(n+nq, d, 1)
 	base, queries := all[:n], all[n:]
@@ -178,10 +188,15 @@ func TestSearchExactAtFullBeam(t *testing.T) {
 
 func refCompare(a, b item) int { return cmp.Or(cmp.Compare(a.dist, b.dist), cmp.Compare(a.id, b.id)) }
 
-// refLayer is Algorithm 2. It returns W in (distance, ID) order.
-func refLayer(g *graph[int], q []float32, ep item, ef, layer int) []item {
+// refLayer is Algorithm 2. It returns W in (distance, ID) order. With filter set,
+// tombstones are walked but kept out of W.
+func refLayer(g *graph[int], q []float32, ep item, ef, layer int, filter bool) []item {
+	admit := func(id uint32) bool { return !filter || !g.isDead(id) }
 	seen := map[uint32]bool{ep.id: true}
-	cand, w := []item{ep}, []item{ep}
+	cand, w := []item{ep}, []item{}
+	if admit(ep.id) {
+		w = append(w, ep)
+	}
 	for len(cand) > 0 {
 		slices.SortFunc(cand, refCompare)
 		c := cand[0]
@@ -197,9 +212,11 @@ func refLayer(g *graph[int], q []float32, ep item, ef, layer int) []item {
 			x := item{distance(q, g.vec(e)), e}
 			if len(w) < ef || x.dist < w[len(w)-1].dist {
 				cand = append(cand, x)
-				w = append(w, x)
-				slices.SortFunc(w, refCompare)
-				w = w[:min(len(w), ef)]
+				if admit(e) {
+					w = append(w, x)
+					slices.SortFunc(w, refCompare)
+					w = w[:min(len(w), ef)]
+				}
 			}
 		}
 	}
@@ -246,15 +263,18 @@ func refAdd(ix *Index[int], key int, v []float32) {
 	g.upOff = append(g.upOff, uint32(len(g.up)/(g.m+1)))
 	g.up = append(g.up, make([]uint32, lv*(g.m+1))...)
 	g.adj0 = append(g.adj0, make([]uint32, 2*g.m+1)...)
+	if id%64 == 0 {
+		g.dead = append(g.dead, 0)
+	}
 	g.keys = append(g.keys, key)
 	g.byKey[key] = id
 	if id > 0 {
 		ep := item{distance(q, g.vec(g.entry)), g.entry}
 		for layer := int(g.top); layer > lv; layer-- {
-			ep = refLayer(g, q, ep, 1, layer)[0]
+			ep = refLayer(g, q, ep, 1, layer, false)[0]
 		}
 		for layer := min(int(g.top), lv); layer >= 0; layer-- {
-			cands := refLayer(g, q, ep, ix.efc, layer)
+			cands := refLayer(g, q, ep, ix.efc, layer, false)
 			ep = cands[0]
 			sel := refSelect(g, cands, g.m)
 			r := g.record(id, layer)
@@ -315,6 +335,7 @@ var referenceData = map[string]func() [][]float32{
 }
 
 func TestPlanMatchesReferenceInserter(t *testing.T) {
+	skipUnderRace(t)
 	for name, data := range referenceData {
 		vecs := data()[:3000]
 		for _, m := range []int{2, 4, 16} {
@@ -341,26 +362,32 @@ func TestPlanMatchesReferenceInserter(t *testing.T) {
 
 // Search is Algorithm 5: descend with ef=1, then search layer 0 with min(max(ef,k), live).
 func TestSearchMatchesReference(t *testing.T) {
+	skipUnderRace(t)
 	const n, k = 3000, 10
 	for name, data := range referenceData {
 		all := data()
 		ix := build(t, all[:n], Options{M: 4, EfConstruction: 40, Seed: 3})
 		g := ix.g
-		for _, ef := range []int{1, 10, 50} {
-			for _, q := range all[n:] {
-				ep := item{distance(q, g.vec(g.entry)), g.entry}
-				for layer := int(g.top); layer > 0; layer-- {
-					ep = refLayer(g, q, ep, 1, layer)[0]
-				}
-				w := refLayer(g, q, ep, min(max(ef, k), int(g.live)), 0)
-				w = w[:min(k, len(w))]
-				want := make([]Result[int], len(w))
-				for i, x := range w {
-					want[i] = Result[int]{g.keys[x.id], max(0, x.dist)}
-				}
-				got, err := ix.Search(q, k, SearchOptions{Ef: ef})
-				if err != nil || !reflect.DeepEqual(got, want) {
-					t.Fatalf("%s ef=%d: got %v, want %v", name, ef, got, want)
+		for _, deleted := range []int{0, n / 3, n - 5} { // live keys from all to fewer than k
+			for key := n - 1; g.deadN < uint32(deleted); key-- {
+				ix.Delete(key)
+			}
+			for _, ef := range []int{1, 10, 50} {
+				for _, q := range all[n : n+60] { // the reference is quadratic on a mostly deleted graph
+					ep := item{distance(q, g.vec(g.entry)), g.entry}
+					for layer := int(g.top); layer > 0; layer-- {
+						ep = refLayer(g, q, ep, 1, layer, false)[0]
+					}
+					w := refLayer(g, q, ep, min(max(ef, k), int(g.live)), 0, true)
+					w = w[:min(k, len(w))]
+					want := make([]Result[int], len(w))
+					for i, x := range w {
+						want[i] = Result[int]{g.keys[x.id], max(0, x.dist)}
+					}
+					got, err := ix.Search(q, k, SearchOptions{Ef: ef})
+					if err != nil || !reflect.DeepEqual(got, want) {
+						t.Fatalf("%s deleted=%d ef=%d: got %v, want %v", name, deleted, ef, got, want)
+					}
 				}
 			}
 		}
@@ -509,10 +536,10 @@ func TestBadInput(t *testing.T) {
 	if err := ix.Add("a", []float32{1, 0, 0}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ix.Add("a", []float32{0, 1, 0}); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("existing key: got %v", err)
+	if err := ix.Add("a", []float32{1, 2, 3, 4}); !errors.Is(err, ErrDimension) {
+		t.Fatalf("replace with a bad vector: got %v", err)
 	}
-	if ix.Len() != 1 {
+	if ix.Len() != 1 || ix.g.n != 1 {
 		t.Fatalf("Len %d", ix.Len())
 	}
 	q := []float32{1, 0, 0}
@@ -691,6 +718,29 @@ func TestVerifyCatchesCorruption(t *testing.T) {
 		},
 	} {
 		ix := build(t, clustered(500, 8, 8), Options{M: 4})
+		if err := ix.g.verify(); err != nil {
+			t.Fatal(err)
+		}
+		corrupt(ix.g)
+		if err := ix.g.verify(); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%s: got %v, want ErrCorrupt", name, err)
+		}
+	}
+	// Built with key 0 deleted, so node 0 is a tombstone.
+	for name, corrupt := range map[string]func(g *graph[int]){
+		"extra tombstone word":   func(g *graph[int]) { g.dead = append(g.dead, 0) },
+		"tombstone bit past n":   func(g *graph[int]) { g.dead[len(g.dead)-1] |= 1 << 63 },
+		"deleted count off":      func(g *graph[int]) { g.deadN++ },
+		"live count off":         func(g *graph[int]) { g.live-- },
+		"bit without count":      func(g *graph[int]) { g.dead[0] |= 1 << 5 },
+		"bit and zero key":       func(g *graph[int]) { g.dead[0] |= 1 << 5; g.keys[5] = 0 },
+		"stray byKey entry":      func(g *graph[int]) { g.byKey[-1] = 0 },
+		"live and byKey both up": func(g *graph[int]) { g.live++; g.byKey[-1] = 0 },
+		"tombstone holds a key":  func(g *graph[int]) { g.keys[0] = 12345 },
+		"key maps elsewhere":     func(g *graph[int]) { g.byKey[g.keys[2]] = 3 },
+	} {
+		ix := build(t, clustered(500, 8, 8), Options{M: 4})
+		ix.Delete(0)
 		if err := ix.g.verify(); err != nil {
 			t.Fatal(err)
 		}
