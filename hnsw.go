@@ -106,8 +106,11 @@ func New[K Key](dim int, o Options) (*Index[K], error) {
 	return ix, nil
 }
 
-// Add inserts or replaces key. The vector is validated, copied and normalized. Same key
-// and same vector is a no-op, so replay is idempotent. On error the index is unchanged.
+// Add inserts or replaces key. The vector is validated, copied and normalized. A vector
+// identical to a stored one, or within cosine distance 1e-6 of one, attaches key to that
+// node instead of making another, and searches then measure key by the stored vector.
+// Same key and a vector within 1e-6 of the one serving it is a no-op, so replay is
+// idempotent. On error the index is unchanged.
 // Errors: ErrDimension, ErrInvalidVector (NaN, Inf, zero), ErrFull, ErrInvalidArgument
 // (zero Index, string key over 2^32-1 bytes).
 func (ix *Index[K]) Add(key K, vector []float32) error {
@@ -124,29 +127,41 @@ func (ix *Index[K]) Add(key K, vector []float32) error {
 		return err
 	}
 	old, exists := g.byKey[key]
-	if exists {
-		// Normalized vectors hold no NaN or -0, so == is bit equality here.
-		if slices.Equal(g.vec(old), w.q) {
-			return nil
-		}
-		key = g.keys[old] // already owned
-	} else {
-		var err error
-		if key, err = ix.ownKey(key); err != nil {
-			return err
-		}
+	if exists && cosineDistance(w.q, g.vec(old)) <= mergeDist {
+		// The key's node already serves this vector: replay is a no-op, even when another
+		// node within mergeDist would come first in a search.
+		return nil
+	}
+	if !exists {
 		old = noEntry
 	}
-	if g.n >= maxNodes {
-		return fmt.Errorf("%w: %d nodes", ErrFull, g.n)
+	id, slot := g.findVec(w.q)
+	lv := 0
+	if id == noEntry {
+		// Checked before plan, so at capacity even an Add that would merge fails.
+		if g.n >= maxNodes {
+			return fmt.Errorf("%w: %d nodes", ErrFull, g.n)
+		}
+		lv = ix.levelOf(g.n)
+		if int64(g.records())+int64(lv) > maxRecords {
+			return fmt.Errorf("%w: upper-layer records", ErrFull)
+		}
+		// plan returns a near-duplicate it found, which then stands in for an exact match.
+		id = ix.plan(g.n, lv)
 	}
-	id := g.n
-	lv := ix.levelOf(id)
-	if int64(g.records())+int64(lv) > maxRecords {
-		return fmt.Errorf("%w: upper-layer records", ErrFull)
+	key, err := ix.ownKey(key)
+	if err != nil {
+		return err
 	}
-	ix.plan(id, lv)
-	g.publish(key, w, id, lv, old)
+	if id == noEntry {
+		id = g.n // a new node, planned above
+	} else {
+		// An alias of a live node or the key of a revived one. Inserts treat tombstones
+		// as ordinary nodes, so a revived node's links are what they would be had it
+		// never died, and it needs no graph work either.
+		w.patches = w.patches[:0]
+	}
+	g.publish(key, w, id, lv, slot, old)
 	return nil
 }
 
@@ -164,8 +179,8 @@ func (ix *Index[K]) ownKey(key K) (K, error) {
 	return key, nil
 }
 
-// Delete removes key and reports whether it existed. The node stays in the graph as a
-// tombstone that searches walk through, so its embedding stays in memory.
+// Delete removes key and reports whether it existed. A node that loses its last key stays
+// in the graph as a tombstone that searches walk through, so its embedding stays in memory.
 func (ix *Index[K]) Delete(key K) bool {
 	g := ix.g
 	if g == nil {
@@ -176,7 +191,7 @@ func (ix *Index[K]) Delete(key K) bool {
 		return false
 	}
 	delete(g.byKey, key)
-	g.kill(id)
+	g.detach(id, key)
 	return true
 }
 
@@ -199,8 +214,18 @@ func (ix *Index[K]) Keys() iter.Seq[K] {
 			return
 		}
 		for id := uint32(0); id < g.n; id++ { // g.n is reread, since the body may Add
-			if !g.isDead(id) && !yield(g.keys[id]) {
+			if g.isDead(id) {
+				continue
+			}
+			// Copied, since the body may delete an alias and so reorder the list.
+			key, as := g.keys[id], slices.Clone(g.alias[id])
+			if !yield(key) {
 				return
+			}
+			for _, a := range as {
+				if !yield(a) {
+					return
+				}
 			}
 		}
 	}
@@ -208,7 +233,7 @@ func (ix *Index[K]) Keys() iter.Seq[K] {
 
 // Stats describes the index. Fields will only be added.
 type Stats struct {
-	Dim, Keys, Nodes, Deleted, MaxLevel int    // Deleted counts tombstoned nodes
+	Dim, Keys, Nodes, Deleted, MaxLevel int    // keys with one vector share a node; Deleted counts tombstoned nodes
 	BudgetStops                         uint64 // searches cut short by the tombstone walk budget
 }
 
@@ -219,7 +244,7 @@ func (ix *Index[K]) Stats() Stats {
 	}
 	return Stats{
 		Dim:         g.dim,
-		Keys:        int(g.live),
+		Keys:        len(g.byKey),
 		Nodes:       int(g.n),
 		Deleted:     int(g.deadN),
 		MaxLevel:    int(g.top),
@@ -241,15 +266,17 @@ func splitmix64(x uint64) uint64 {
 	return x ^ (x >> 31)
 }
 
-// plan computes the new node's lists and its neighbours' updated lists into ix.w without
-// writing the graph. Each layer's search reads only that layer's lists, and the updates
-// for a layer touch only that layer, so deferring them gives the graph that in-place
-// insertion in the paper's order would.
-func (ix *Index[K]) plan(id uint32, lv int) {
+// plan computes the lists of new node id and its neighbours' updated lists into ix.w
+// without writing the graph. Each layer's search reads only that layer's lists, and the
+// updates for a layer touch only that layer, so deferring them gives the graph that
+// in-place insertion in the paper's order would. If it finds a stored node within
+// mergeDist, plan stops and returns it, leaving the plan unusable; otherwise it returns
+// noEntry.
+func (ix *Index[K]) plan(id uint32, lv int) (near uint32) {
 	g, w := ix.g, &ix.w
 	w.patches, w.words = w.patches[:0], w.words[:0]
 	if g.n == 0 {
-		return
+		return noEntry
 	}
 	q := w.q
 	ep := item{distance(q, g.vec(g.entry)), g.entry}
@@ -259,6 +286,11 @@ func (ix *Index[K]) plan(id uint32, lv int) {
 	for layer := min(int(g.top), lv); layer >= 0; layer-- {
 		g.searchLayer(w, q, ep, ix.efc, layer, false)
 		cands := w.sortedW()
+		if layer == 0 {
+			if near := g.nearDuplicate(cands, q); near != noEntry {
+				return near
+			}
+		}
 		ep = cands[0]
 		w.sel = g.selectNeighbors(w.sel, cands, g.m, id, q)
 		off := len(w.words)
@@ -270,6 +302,42 @@ func (ix *Index[K]) plan(id uint32, lv int) {
 			ix.planBackLink(s.id, id, layer)
 		}
 	}
+	return noEntry
+}
+
+// mergeDist is the cosine distance at or below which a new vector joins a stored node
+// instead of becoming one. Copies that close differ by rounding noise, where float32
+// distances tie, and many of them make Algorithm 4 strand nodes. It is a variable only
+// so tests can change it.
+var mergeDist = 1e-6
+
+// nearDuplicate returns the first of cands, sorted by float32 distance to q, whose exact
+// cosine distance to q is at most mergeDist, or noEntry.
+func (g *graph[K]) nearDuplicate(cands []item, q []float32) uint32 {
+	// The float32 distance is off by at most about dim*2^-24, and by the stored norms,
+	// whose squares may sit normTolerance from 1.
+	limit := float32(mergeDist+2*normTolerance) + float32(g.dim)*0x1p-23
+	for _, c := range cands {
+		if c.dist > limit {
+			break
+		}
+		if cosineDistance(q, g.vec(c.id)) <= mergeDist {
+			return c.id
+		}
+	}
+	return noEntry
+}
+
+// cosineDistance is 1-cos in float64, accurate to far below mergeDist.
+func cosineDistance(a, b []float32) float64 {
+	var ab, aa, bb float64
+	for i, x := range a {
+		y := float64(b[i])
+		ab += float64(x) * y
+		aa += float64(x) * float64(x)
+		bb += y * y
+	}
+	return 1 - ab/math.Sqrt(aa*bb)
 }
 
 // planBackLink records e's list on layer with id added, re-selecting with Algorithm 4
@@ -302,5 +370,5 @@ func (ix *Index[K]) Len() int {
 	if ix.g == nil {
 		return 0
 	}
-	return int(ix.g.live)
+	return len(ix.g.byKey)
 }

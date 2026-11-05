@@ -73,9 +73,23 @@ func (ix *Index[K]) Search(query []float32, k int, o SearchOptions) ([]Result[K]
 	if stopped {
 		ix.budgetStops.Add(1)
 	}
-	out := make([]Result[K], len(found))
-	for i, x := range found {
-		out[i] = Result[K]{g.keys[x.id], max(0, x.dist)}
+	size := 0
+	for _, x := range found {
+		size += 1 + len(g.alias[x.id])
+	}
+	out := make([]Result[K], 0, min(size, k))
+	for _, x := range found {
+		d := max(0, x.dist)
+		out = append(out, Result[K]{g.keys[x.id], d})
+		for _, a := range g.alias[x.id] {
+			if len(out) == k {
+				break
+			}
+			out = append(out, Result[K]{a, d})
+		}
+		if len(out) == k {
+			break
+		}
 	}
 	return out, nil
 }

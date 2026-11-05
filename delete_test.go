@@ -583,10 +583,14 @@ func FuzzOps(f *testing.F) {
 			t.Fatal(err)
 		}
 		model := map[uint32][]float32{}
+		stored := map[[4]float32]bool{} // every vector a key was served by: one node each
 		var st searchState
 		for len(ops) >= 6 {
 			op, key, vec := ops[0]%4, uint32(ops[1]%32), fuzzVector(ops[2:6])
 			ops = ops[6:]
+			if op == 1 {
+				vec[0] += 1e-6 // usually a near-duplicate of a vector op 0 adds
+			}
 			switch op {
 			case 0, 1:
 				q := make([]float32, 4)
@@ -600,7 +604,13 @@ func FuzzOps(f *testing.F) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				model[key] = q
+				// The key is served by q or by a stored vector within mergeDist of it.
+				served := slices.Clone(ix.g.vec(ix.g.byKey[key]))
+				if !sameBits(served, q) && cosineDistance(served, q) > mergeDist {
+					t.Fatalf("key %d added as %v is served by %v", key, q, served)
+				}
+				model[key] = served
+				stored[[4]float32(served)] = true
 			case 2:
 				_, ok := model[key]
 				if ix.Delete(key) != ok {
@@ -624,16 +634,15 @@ func FuzzOps(f *testing.F) {
 					}
 					continue
 				}
-				found, landing, _ := ix.g.search(&st, q, k, maxBeam)
-				if len(found) != len(res) {
-					t.Fatalf("Search gave %d results, search %d", len(res), len(found))
-				}
+				_, landing, _ := ix.g.search(&st, q, k, maxBeam)
+				seen := map[uint32]bool{}
 				for i, r := range res {
 					want, ok := model[r.Key]
-					if !ok {
-						t.Fatalf("deleted key %d returned", r.Key)
+					if !ok || seen[r.Key] {
+						t.Fatalf("deleted or repeated key %d returned", r.Key)
 					}
-					if r.Key != ix.g.keys[found[i].id] || r.Distance != max(0, distance(q, want)) {
+					seen[r.Key] = true
+					if r.Distance != max(0, distance(q, want)) || i > 0 && r.Distance < res[i-1].Distance {
 						t.Fatalf("result %d: %+v", i, r)
 					}
 				}
@@ -642,7 +651,9 @@ func FuzzOps(f *testing.F) {
 				var reachable []float32
 				for _, id := range ix.g.reach(landing) {
 					if !ix.g.isDead(id) {
-						reachable = append(reachable, max(0, distance(q, ix.g.vec(id))))
+						for range 1 + len(ix.g.alias[id]) {
+							reachable = append(reachable, max(0, distance(q, ix.g.vec(id))))
+						}
 					}
 				}
 				slices.Sort(reachable)
@@ -658,8 +669,8 @@ func FuzzOps(f *testing.F) {
 			if err := ix.g.verify(); err != nil {
 				t.Fatal(err)
 			}
-			if ix.Len() != len(model) {
-				t.Fatalf("Len %d, model %d", ix.Len(), len(model))
+			if ix.Len() != len(model) || int(ix.g.n) != len(stored) {
+				t.Fatalf("Len %d, model %d; %d nodes for %d vectors", ix.Len(), len(model), ix.g.n, len(stored))
 			}
 			if got, want := slices.Sorted(ix.Keys()), slices.Sorted(maps.Keys(model)); !slices.Equal(got, want) {
 				t.Fatalf("keys %v, model %v", got, want)
