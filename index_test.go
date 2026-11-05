@@ -243,15 +243,31 @@ func refSelect(g *graph[int], cands []item, m int) []item {
 	return out
 }
 
-// refAdd inserts in place in the paper's order, writing each list as soon as it is
-// chosen. Plan-then-publish must build the same graph.
+// refAdd inserts a new key in place in the paper's order, writing each list as soon as
+// it is chosen. A vector already stored becomes an alias. Plan-then-publish must build
+// the same graph.
 func refAdd(ix *Index[int], key int, v []float32) {
 	g := ix.g
 	q := make([]float32, g.dim)
 	if err := normalize(q, v); err != nil {
 		panic(err)
 	}
+	for id := range g.n {
+		if sameBits(g.vec(id), q) {
+			if g.isDead(id) {
+				panic("refAdd does not revive")
+			}
+			g.alias[id] = append(g.alias[id], key)
+			g.byKey[key] = id
+			return
+		}
+	}
+	h := hashVec(g.seed, q)
+	for _, ok := g.byVec[h]; ok; _, ok = g.byVec[h] {
+		h++
+	}
 	id, lv := g.n, ix.levelOf(g.n)
+	g.byVec[h] = id
 	capOf := func(layer int) int {
 		if layer == 0 {
 			return 2 * g.m
@@ -344,6 +360,7 @@ func TestPlanMatchesReferenceInserter(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			want.g.seed = got.g.seed
 			for i, v := range vecs {
 				refAdd(want, i, v)
 			}
@@ -352,6 +369,9 @@ func TestPlanMatchesReferenceInserter(t *testing.T) {
 			}
 			if want.g.top == 0 {
 				t.Fatalf("%s M=%d: no upper layers, so they went untested", name, m)
+			}
+			if name == "lattice" && len(want.g.alias) == 0 {
+				t.Fatalf("%s M=%d: no aliases, so they went untested", name, m)
 			}
 			if !reflect.DeepEqual(got.g, want.g) {
 				t.Fatalf("%s M=%d: graphs differ", name, m)
@@ -368,8 +388,10 @@ func TestSearchMatchesReference(t *testing.T) {
 		all := data()
 		ix := build(t, all[:n], Options{M: 4, EfConstruction: 40, Seed: 3})
 		g := ix.g
-		for _, deleted := range []int{0, n / 3, n - 5} { // live keys from all to fewer than k
-			for key := n - 1; g.deadN < uint32(deleted); key-- {
+		nodes := int(g.n) // fewer than n on lattice data, whose duplicates share nodes
+		key := n - 1
+		for _, deleted := range []int{0, nodes / 3, nodes - 5} { // live nodes from all to fewer than k
+			for ; g.deadN < uint32(deleted); key-- {
 				ix.Delete(key)
 			}
 			for _, ef := range []int{1, 10, 50} {
@@ -379,11 +401,13 @@ func TestSearchMatchesReference(t *testing.T) {
 						ep = refLayer(g, q, ep, 1, layer, false)[0]
 					}
 					w := refLayer(g, q, ep, min(max(ef, k), int(g.live)), 0, true)
-					w = w[:min(k, len(w))]
-					want := make([]Result[int], len(w))
-					for i, x := range w {
-						want[i] = Result[int]{g.keys[x.id], max(0, x.dist)}
+					want := []Result[int]{}
+					for _, x := range w {
+						for _, key := range append([]int{g.keys[x.id]}, g.alias[x.id]...) {
+							want = append(want, Result[int]{key, max(0, x.dist)})
+						}
 					}
+					want = want[:min(k, len(want))]
 					got, err := ix.Search(q, k, SearchOptions{Ef: ef})
 					if err != nil || !reflect.DeepEqual(got, want) {
 						t.Fatalf("%s deleted=%d ef=%d: got %v, want %v", name, deleted, ef, got, want)
@@ -743,6 +767,57 @@ func TestVerifyCatchesCorruption(t *testing.T) {
 		ix.Delete(0)
 		if err := ix.g.verify(); err != nil {
 			t.Fatal(err)
+		}
+		corrupt(ix.g)
+		if err := ix.g.verify(); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("%s: got %v, want ErrCorrupt", name, err)
+		}
+	}
+	// Built with key 0 deleted and keys 1000 and 1001 on node 2's vector.
+	for name, corrupt := range map[string]func(g *graph[int]){
+		"alias on tombstone":     func(g *graph[int]) { g.alias[0] = []int{77}; g.byKey[77] = 0 },
+		"alias out of range":     func(g *graph[int]) { g.alias[g.n] = []int{77}; g.byKey[77] = g.n },
+		"empty alias list":       func(g *graph[int]) { g.alias[5] = []int{} },
+		"alias not in byKey":     func(g *graph[int]) { delete(g.byKey, 1001) },
+		"alias maps elsewhere":   func(g *graph[int]) { g.byKey[1000] = 3 },
+		"repeated alias":         func(g *graph[int]) { g.alias[2] = append(g.alias[2], 1000) },
+		"alias repeats primary":  func(g *graph[int]) { g.alias[2] = append(g.alias[2], g.keys[2]) },
+		"alias moved to primary": func(g *graph[int]) { g.alias[3] = []int{g.keys[3]} },
+		"missing vector hash": func(g *graph[int]) {
+			for h := range g.byVec {
+				delete(g.byVec, h)
+				return
+			}
+		},
+		"vector hash out of range": func(g *graph[int]) {
+			for h := range g.byVec {
+				g.byVec[h] = g.n
+				return
+			}
+		},
+		"two hashes for one node": func(g *graph[int]) {
+			_, h := g.findVec(g.vec(5))
+			g.byVec[h] = 4
+		},
+		"duplicate vector": func(g *graph[int]) { copy(g.vec(4), g.vec(5)) },
+		"extra vector hash": func(g *graph[int]) { // past node 5's chain, so every probe still resolves
+			_, h := g.findVec(g.vec(5))
+			for _, ok := g.byVec[h]; ok; _, ok = g.byVec[h] {
+				h++
+			}
+			g.byVec[h] = 3
+		},
+	} {
+		vecs := clustered(500, 8, 8)
+		ix := build(t, vecs, Options{M: 4})
+		ix.Delete(0)
+		for _, key := range []int{1000, 1001} {
+			if err := ix.Add(key, vecs[2]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := ix.g.verify(); err != nil || len(ix.g.alias[2]) != 2 {
+			t.Fatalf("%v, aliases %v", err, ix.g.alias)
 		}
 		corrupt(ix.g)
 		if err := ix.g.verify(); !errors.Is(err, ErrCorrupt) {

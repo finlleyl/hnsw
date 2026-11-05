@@ -50,7 +50,7 @@ func (g *graph[K]) verify() error {
 	if int64(records) > maxRecords || len(g.up) != records*(g.m+1) {
 		return bad("%d upper words for %d records", len(g.up), records)
 	}
-	// I9 and the single-key part of I5 and I6: counts, tombstones and keys.
+	// I9: counts and tombstones.
 	deadN := 0
 	for i, w := range g.dead {
 		if i == len(g.dead)-1 && n%64 != 0 && w>>(n%64) != 0 {
@@ -61,18 +61,40 @@ func (g *graph[K]) verify() error {
 	if deadN != int(g.deadN) || g.live != g.n-g.deadN {
 		return bad("live %d, deleted %d, but %d of %d nodes are tombstones", g.live, g.deadN, deadN, n)
 	}
-	if len(g.byKey) != int(g.live) {
-		return bad("%d keys for %d live nodes", len(g.byKey), g.live)
+	// I5 and I6: byKey maps exactly the primaries of live nodes and their aliases, and
+	// tombstones hold no key.
+	for id, as := range g.alias {
+		if id >= g.n || g.isDead(id) || len(as) == 0 {
+			return bad("alias list of %d keys on node %d", len(as), id)
+		}
 	}
 	var zero K
+	held := make(map[K]bool, len(g.byKey))
+	hold := func(id uint32, key K) error {
+		if got, ok := g.byKey[key]; !ok || got != id || held[key] {
+			return bad("node %d key maps to %d or repeats", id, got)
+		}
+		held[key] = true
+		return nil
+	}
 	for id := range g.n {
 		if g.isDead(id) {
 			if g.keys[id] != zero {
 				return bad("tombstone %d holds a key", id)
 			}
-		} else if got, ok := g.byKey[g.keys[id]]; !ok || got != id {
-			return bad("node %d key maps to %d", id, got)
+			continue
 		}
+		if err := hold(id, g.keys[id]); err != nil {
+			return err
+		}
+		for _, a := range g.alias[id] {
+			if err := hold(id, a); err != nil {
+				return err
+			}
+		}
+	}
+	if len(held) != len(g.byKey) {
+		return bad("%d keys held, %d in the key map", len(held), len(g.byKey))
 	}
 	// I1-I3: links.
 	var seen visited
@@ -114,6 +136,21 @@ func (g *graph[K]) verify() error {
 			if math.Float32bits(v[i]) != math.Float32bits(buf[i]) {
 				return bad("node %d vector is not normalized", id)
 			}
+		}
+	}
+	// I7: byVec indexes every node, and the probe for each node's bits stops at that node,
+	// so no two nodes share bits.
+	if len(g.byVec) != n {
+		return bad("%d vector hashes for %d nodes", len(g.byVec), n)
+	}
+	for _, id := range g.byVec {
+		if id >= g.n {
+			return bad("vector hash maps to node %d of %d", id, n)
+		}
+	}
+	for id := range g.n {
+		if got, _ := g.findVec(g.vec(id)); got != id {
+			return bad("node %d vector found at node %d", id, got)
 		}
 	}
 	return nil

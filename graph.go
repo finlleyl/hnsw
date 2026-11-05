@@ -1,5 +1,12 @@
 package hnsw
 
+import (
+	"encoding/binary"
+	"hash/maphash"
+	"math"
+	"slices"
+)
+
 const (
 	chunkShift = 12 // 4096 vectors per chunk, so growth never copies more than one chunk
 	chunkSize  = 1 << chunkShift
@@ -20,13 +27,54 @@ type graph[K Key] struct {
 	up             []uint32    // upper records of m+1 words, appended in node-ID order
 	upOff          []uint32    // index of a node's first upper record, valid when level > 0
 	level          []uint8
-	dead           []uint64 // tombstone bitset
-	keys           []K      // primary key per node; zero value when dead
+	dead           []uint64       // tombstone bitset
+	keys           []K            // primary key per node; zero value when dead
+	alias          map[uint32][]K // extra keys of live nodes; empty for almost every index
 	byKey          map[K]uint32
+	byVec          map[uint64]uint32 // vector hash to node, probing upward on collision
+	seed           maphash.Seed      // for byVec, which is never saved
 }
 
 func newGraph[K Key](dim, m int) *graph[K] {
-	return &graph[K]{dim: dim, m: m, entry: noEntry, byKey: map[K]uint32{}}
+	return &graph[K]{
+		dim: dim, m: m, entry: noEntry,
+		alias: map[uint32][]K{}, byKey: map[K]uint32{}, byVec: map[uint64]uint32{},
+		seed: maphash.MakeSeed(),
+	}
+}
+
+// hashVec hashes a vector's bits. It is a variable only so tests can weaken it.
+var hashVec = func(seed maphash.Seed, v []float32) uint64 {
+	var h maphash.Hash
+	h.SetSeed(seed)
+	var b [256]byte
+	for len(v) > 0 {
+		n := min(len(v), len(b)/4)
+		for i, x := range v[:n] {
+			binary.LittleEndian.PutUint32(b[4*i:], math.Float32bits(x))
+		}
+		h.Write(b[:4*n])
+		v = v[n:]
+	}
+	return h.Sum64()
+}
+
+// findVec returns the node holding v's exact bits, live or dead, or noEntry and the
+// free byVec slot where a new node for v belongs. byVec never loses entries before a
+// rebuild, so every probe chain is unbroken.
+func (g *graph[K]) findVec(v []float32) (id uint32, slot uint64) {
+	h := hashVec(g.seed, v)
+	for {
+		id, ok := g.byVec[h]
+		if !ok {
+			return noEntry, h
+		}
+		// Stored vectors hold no NaN or -0, so == is bit equality here.
+		if slices.Equal(g.vec(id), v) {
+			return id, h
+		}
+		h++
+	}
 }
 
 func (g *graph[K]) vec(id uint32) []float32 {
@@ -37,8 +85,30 @@ func (g *graph[K]) vec(id uint32) []float32 {
 
 func (g *graph[K]) isDead(id uint32) bool { return g.dead[id/64]&(1<<(id%64)) != 0 }
 
-// kill tombstones a live node. Its links stay, so no edge can dangle and searches still
-// walk through it. byKey is the caller's to update.
+// detach removes key from live node id. The last alias replaces a departing primary, and
+// a node left with no key is tombstoned. byKey is the caller's to update.
+func (g *graph[K]) detach(id uint32, key K) {
+	as := g.alias[id]
+	if g.keys[id] == key {
+		if len(as) == 0 {
+			g.kill(id)
+			return
+		}
+		g.keys[id] = as[len(as)-1]
+	} else {
+		as[slices.Index(as, key)] = as[len(as)-1]
+	}
+	var zero K
+	as[len(as)-1] = zero // so a removed string key is not pinned
+	if len(as) == 1 {
+		delete(g.alias, id)
+	} else {
+		g.alias[id] = as[:len(as)-1]
+	}
+}
+
+// kill tombstones a live node with no aliases. Its links stay, so no edge can dangle and
+// searches still walk through it. byKey is the caller's to update.
 func (g *graph[K]) kill(id uint32) {
 	g.dead[id/64] |= 1 << (id % 64)
 	var zero K
@@ -92,32 +162,44 @@ type patch struct {
 	off, n int
 }
 
-// publish stores a planned node: its vector from w.q, its key, and every list in
-// w.patches, including the node's own. A replaced node, old, is tombstoned in the same
-// step; noEntry means none.
-func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int, old uint32) {
-	g.appendVec(w.q)
-	g.level = append(g.level, uint8(lv))
-	g.upOff = append(g.upOff, uint32(g.records()))
-	g.up = append(g.up, make([]uint32, lv*(g.m+1))...)
-	g.adj0 = append(g.adj0, make([]uint32, 2*g.m+1)...)
-	if id%64 == 0 {
-		g.dead = append(g.dead, 0)
+// publish applies a planned Add of key to node id: a new node when id is g.n, with its
+// vector from w.q, level lv and byVec slot; a revived tombstone; or an alias of a live
+// node. Every list in w.patches is stored. The key's previous node, old, loses the key
+// in the same step; noEntry means none.
+func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int, slot uint64, old uint32) {
+	switch {
+	case id == g.n:
+		g.appendVec(w.q)
+		g.level = append(g.level, uint8(lv))
+		g.upOff = append(g.upOff, uint32(g.records()))
+		g.up = append(g.up, make([]uint32, lv*(g.m+1))...)
+		g.adj0 = append(g.adj0, make([]uint32, 2*g.m+1)...)
+		if id%64 == 0 {
+			g.dead = append(g.dead, 0)
+		}
+		g.keys = append(g.keys, key)
+		g.byVec[slot] = id
+		if g.n == 0 || lv > int(g.top) {
+			g.entry, g.top = id, uint8(lv)
+		}
+		g.n++
+		g.live++
+	case g.isDead(id):
+		g.dead[id/64] &^= 1 << (id % 64)
+		g.keys[id] = key
+		g.live++
+		g.deadN--
+	default:
+		g.alias[id] = append(g.alias[id], key)
 	}
-	g.keys = append(g.keys, key)
 	g.byKey[key] = id
 	for _, p := range w.patches {
 		r := g.record(p.id, p.layer)
 		r[0] = uint32(copy(r[1:], w.words[p.off:p.off+p.n]))
 		clear(r[1+p.n:])
 	}
-	if g.n == 0 || lv > int(g.top) {
-		g.entry, g.top = id, uint8(lv)
-	}
-	g.n++
-	g.live++
 	if old != noEntry {
-		g.kill(old)
+		g.detach(old, key)
 	}
 }
 
