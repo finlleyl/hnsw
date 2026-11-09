@@ -162,22 +162,53 @@ type patch struct {
 	off, n int
 }
 
+// addition holds slice headers prepared outside the read/write lock. Appends write only
+// unused capacity or new backing arrays, which readers cannot reach before publish.
+type addition[K Key] struct {
+	vecs  [][]float32
+	vec   []float32
+	chunk int
+	adj0  []uint32
+	up    []uint32
+	upOff []uint32
+	level []uint8
+	dead  []uint64
+	keys  []K
+	alias []K
+}
+
+func (g *graph[K]) prepareAdd(key K, w *searchState, id uint32, lv int) addition[K] {
+	var a addition[K]
+	if id != g.n {
+		if !g.isDead(id) {
+			a.alias = append(g.alias[id], key)
+		}
+		return a
+	}
+	a.vecs, a.vec, a.chunk = appendVector(g.vecs, g.n, g.dim, w.q)
+	a.level = append(g.level, uint8(lv))
+	a.upOff = append(g.upOff, uint32(g.records()))
+	a.up = append(g.up, make([]uint32, lv*(g.m+1))...)
+	a.adj0 = append(g.adj0, make([]uint32, 2*g.m+1)...)
+	a.dead = g.dead
+	if id%64 == 0 {
+		a.dead = append(a.dead, 0)
+	}
+	a.keys = append(g.keys, key)
+	return a
+}
+
 // publish applies a planned Add of key to node id: a new node when id is g.n, with its
 // vector from w.q, level lv and byVec slot; a revived tombstone; or an alias of a live
 // node. Every list in w.patches is stored. The key's previous node, old, loses the key
-// in the same step; noEntry means none.
-func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int, slot uint64, old uint32) {
+// in the same step; noEntry means none. Slice growth is already done; only preallocated
+// stores and map inserts remain, so a panic cannot expose a half-applied Add.
+func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int, slot uint64, old uint32, a *addition[K]) {
 	switch {
 	case id == g.n:
-		g.appendVec(w.q)
-		g.level = append(g.level, uint8(lv))
-		g.upOff = append(g.upOff, uint32(g.records()))
-		g.up = append(g.up, make([]uint32, lv*(g.m+1))...)
-		g.adj0 = append(g.adj0, make([]uint32, 2*g.m+1)...)
-		if id%64 == 0 {
-			g.dead = append(g.dead, 0)
-		}
-		g.keys = append(g.keys, key)
+		g.vecs, g.level, g.upOff = a.vecs, a.level, a.upOff
+		g.vecs[a.chunk] = a.vec
+		g.up, g.adj0, g.dead, g.keys = a.up, a.adj0, a.dead, a.keys
 		g.byVec[slot] = id
 		if g.n == 0 || lv > int(g.top) {
 			g.entry, g.top = id, uint8(lv)
@@ -190,7 +221,7 @@ func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int, slot uint64
 		g.live++
 		g.deadN--
 	default:
-		g.alias[id] = append(g.alias[id], key)
+		g.alias[id] = a.alias
 	}
 	g.byKey[key] = id
 	for _, p := range w.patches {
@@ -204,18 +235,29 @@ func (g *graph[K]) publish(key K, w *searchState, id uint32, lv int, slot uint64
 }
 
 func (g *graph[K]) appendVec(v []float32) {
-	c := int(g.n >> chunkShift)
-	if c == len(g.vecs) {
-		size := chunkSize * g.dim
+	vecs, vec, chunk := appendVector(g.vecs, g.n, g.dim, v)
+	g.vecs = vecs
+	g.vecs[chunk] = vec
+}
+
+func appendVector(vecs [][]float32, n uint32, dim int, v []float32) ([][]float32, []float32, int) {
+	c := int(n >> chunkShift)
+	var vec []float32
+	if c == len(vecs) {
+		size := chunkSize * dim
 		if c == 0 {
-			size = g.dim
+			size = dim
 		}
-		g.vecs = append(g.vecs, make([]float32, 0, size))
+		vecs = append(vecs, vec)
+		vec = make([]float32, 0, size)
+	} else {
+		vec = vecs[c]
 	}
-	if s := g.vecs[c]; len(s) == cap(s) { // only chunk 0 fills before its last vector
-		grown := make([]float32, len(s), min(2*cap(s), chunkSize*g.dim))
-		copy(grown, s)
-		g.vecs[c] = grown
+	if len(vec) == cap(vec) { // only chunk 0 fills before its last vector
+		grown := make([]float32, len(vec), min(2*cap(vec), chunkSize*dim))
+		copy(grown, vec)
+		vec = grown
 	}
-	g.vecs[c] = append(g.vecs[c], v...)
+	vec = append(vec, v...)
+	return vecs, vec, c
 }

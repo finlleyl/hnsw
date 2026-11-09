@@ -43,8 +43,7 @@ var deadBudget = 65536
 // order is unspecified. Allocation is bounded by live keys, not by k. Errors:
 // ErrDimension, ErrInvalidVector, ErrInvalidArgument.
 func (ix *Index[K]) Search(query []float32, k int, o SearchOptions) ([]Result[K], error) {
-	g := ix.g
-	if g == nil {
+	if ix.dim == 0 {
 		return nil, fmt.Errorf("%w: zero Index", ErrInvalidArgument)
 	}
 	if k < 1 || k > maxBeam {
@@ -57,15 +56,18 @@ func (ix *Index[K]) Search(query []float32, k int, o SearchOptions) ([]Result[K]
 	if ef < 1 || ef > maxBeam {
 		return nil, fmt.Errorf("%w: Ef %d outside 1..%d", ErrInvalidArgument, o.Ef, maxBeam)
 	}
-	if len(query) != g.dim {
-		return nil, fmt.Errorf("%w: dimension %d, want %d", ErrDimension, len(query), g.dim)
+	if len(query) != ix.dim {
+		return nil, fmt.Errorf("%w: dimension %d, want %d", ErrDimension, len(query), ix.dim)
 	}
 	st := ix.pool.Get().(*searchState)
 	defer ix.pool.Put(st)
-	st.q = slices.Grow(st.q[:0], g.dim)[:g.dim]
+	st.q = slices.Grow(st.q[:0], ix.dim)[:ix.dim]
 	if err := normalize(st.q, query); err != nil {
 		return nil, err
 	}
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	g := ix.g
 	if g.live == 0 {
 		return nil, nil
 	}

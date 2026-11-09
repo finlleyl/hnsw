@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Errors returned by this package. Match them with errors.Is; they are wrapped with detail.
@@ -53,15 +54,16 @@ const (
 // It is a variable only so tests can lower it.
 var maxKeyBytes uint64 = 1<<32 - 1
 
-// Index is an approximate nearest neighbour index. Searches, Contains, Len, Keys and
-// Stats may run concurrently with each other, but Add and Delete must not run
-// concurrently with any other method.
+// Index is an approximate nearest neighbour index. All methods are safe for concurrent use.
 type Index[K Key] struct {
+	wmu         sync.Mutex // serializes Add and Delete
+	mu          rwLock
 	g           *graph[K]
 	pool        sync.Pool   // *searchState for Search
-	w           searchState // writer scratch for Add
+	w           searchState // writer scratch for Add, guarded by wmu
 	budgetStops atomic.Uint64
-	efc         int // immutable after New, like the fields below
+	dim         int // immutable after New, like the fields below
+	efc         int
 	ef          int
 	ml          float64 // level multiplier 1/ln(M)
 	seed        uint64
@@ -95,6 +97,7 @@ func New[K Key](dim int, o Options) (*Index[K], error) {
 	}
 	ix := &Index[K]{
 		g:    newGraph[K](dim, o.M),
+		dim:  dim,
 		efc:  o.EfConstruction,
 		ef:   o.Ef,
 		ml:   1 / math.Log(float64(o.M)),
@@ -106,6 +109,12 @@ func New[K Key](dim int, o Options) (*Index[K], error) {
 	return ix, nil
 }
 
+// These hooks are set only by benchmarks before workers start, for the G1 comparison.
+var (
+	wholeInsert     bool
+	publishObserver func(time.Duration)
+)
+
 // Add inserts or replaces key. The vector is validated, copied and normalized. A vector
 // identical to a stored one, or within cosine distance 1e-6 of one, attaches key to that
 // node instead of making another, and searches then measure key by the stored vector.
@@ -114,20 +123,26 @@ func New[K Key](dim int, o Options) (*Index[K], error) {
 // Errors: ErrDimension, ErrInvalidVector (NaN, Inf, zero), ErrFull, ErrInvalidArgument
 // (zero Index, string key over 2^32-1 bytes).
 func (ix *Index[K]) Add(key K, vector []float32) error {
-	g := ix.g
-	if g == nil {
+	if ix.dim == 0 {
 		return fmt.Errorf("%w: zero Index", ErrInvalidArgument)
 	}
-	if len(vector) != g.dim {
-		return fmt.Errorf("%w: dimension %d, want %d", ErrDimension, len(vector), g.dim)
+	if len(vector) != ix.dim {
+		return fmt.Errorf("%w: dimension %d, want %d", ErrDimension, len(vector), ix.dim)
 	}
-	w := &ix.w
-	w.q = slices.Grow(w.q[:0], g.dim)[:g.dim]
-	if err := normalize(w.q, vector); err != nil {
+	q := make([]float32, ix.dim)
+	if err := normalize(q, vector); err != nil {
 		return err
 	}
+	ix.wmu.Lock()
+	defer ix.wmu.Unlock()
+	if wholeInsert {
+		ix.mu.Lock()
+		defer ix.mu.Unlock()
+	}
+	g, w := ix.g, &ix.w
+	w.q = q
 	old, exists := g.byKey[key]
-	if exists && cosineDistance(w.q, g.vec(old)) <= mergeDist {
+	if exists && cosineDistance(q, g.vec(old)) <= mergeDist {
 		// The key's node already serves this vector: replay is a no-op, even when another
 		// node within mergeDist would come first in a search.
 		return nil
@@ -135,7 +150,7 @@ func (ix *Index[K]) Add(key K, vector []float32) error {
 	if !exists {
 		old = noEntry
 	}
-	id, slot := g.findVec(w.q)
+	id, slot := g.findVec(q)
 	lv := 0
 	if id == noEntry {
 		// Checked before plan, so at capacity even an Add that would merge fails.
@@ -161,7 +176,21 @@ func (ix *Index[K]) Add(key K, vector []float32) error {
 		// never died, and it needs no graph work either.
 		w.patches = w.patches[:0]
 	}
-	g.publish(key, w, id, lv, slot, old)
+	a := g.prepareAdd(key, w, id, lv)
+	if !wholeInsert {
+		ix.mu.Lock()
+	}
+	var started time.Time
+	if publishObserver != nil {
+		started = time.Now()
+	}
+	g.publish(key, w, id, lv, slot, old, &a)
+	if publishObserver != nil {
+		publishObserver(time.Since(started))
+	}
+	if !wholeInsert {
+		ix.mu.Unlock()
+	}
 	return nil
 }
 
@@ -182,6 +211,8 @@ func (ix *Index[K]) ownKey(key K) (K, error) {
 // Delete removes key and reports whether it existed. A node that loses its last key stays
 // in the graph as a tombstone that searches walk through, so its embedding stays in memory.
 func (ix *Index[K]) Delete(key K) bool {
+	ix.wmu.Lock()
+	defer ix.wmu.Unlock()
 	g := ix.g
 	if g == nil {
 		return false
@@ -190,13 +221,17 @@ func (ix *Index[K]) Delete(key K) bool {
 	if !ok {
 		return false
 	}
+	ix.mu.Lock()
 	delete(g.byKey, key)
 	g.detach(id, key)
+	ix.mu.Unlock()
 	return true
 }
 
 // Contains reports whether key is in the index.
 func (ix *Index[K]) Contains(key K) bool {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	if ix.g == nil {
 		return false
 	}
@@ -209,16 +244,20 @@ func (ix *Index[K]) Contains(key K) bool {
 // appear, repeat or be missed.
 func (ix *Index[K]) Keys() iter.Seq[K] {
 	return func(yield func(K) bool) {
-		g := ix.g
-		if g == nil {
-			return
-		}
-		for id := uint32(0); id < g.n; id++ { // g.n is reread, since the body may Add
+		for id := uint32(0); ; id++ {
+			ix.mu.RLock()
+			g := ix.g
+			if g == nil || id >= g.n {
+				ix.mu.RUnlock()
+				return
+			}
 			if g.isDead(id) {
+				ix.mu.RUnlock()
 				continue
 			}
 			// Copied, since the body may delete an alias and so reorder the list.
 			key, as := g.keys[id], slices.Clone(g.alias[id])
+			ix.mu.RUnlock()
 			if !yield(key) {
 				return
 			}
@@ -238,6 +277,8 @@ type Stats struct {
 }
 
 func (ix *Index[K]) Stats() Stats {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	g := ix.g
 	if g == nil {
 		return Stats{}
@@ -367,6 +408,8 @@ func (ix *Index[K]) planBackLink(e, id uint32, layer int) {
 
 // Len returns the number of keys in the index.
 func (ix *Index[K]) Len() int {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
 	if ix.g == nil {
 		return 0
 	}
