@@ -71,7 +71,7 @@ type Index[K Key] struct {
 }
 
 // New validates everything up front. dim is fixed for the life of the index, 1..65536.
-// An Index must come from New. On a zero Index, methods that return an error return
+// An Index must come from New or Load. On a zero Index, methods that return an error return
 // ErrInvalidArgument and the others return zero values.
 func New[K Key](dim int, o Options) (*Index[K], error) {
 	if dim < 1 || dim > maxDim {

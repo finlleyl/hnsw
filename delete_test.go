@@ -565,7 +565,7 @@ func fuzzVector(b []byte) []float32 {
 	return v
 }
 
-// FuzzOps runs byte-driven Add, Delete and Search sequences against a map model.
+// FuzzOps runs byte-driven Add, Delete, Search and Save/Load sequences against a map model.
 func FuzzOps(f *testing.F) {
 	f.Add([]byte{0, 0, 1, 1, 2, 3, 4, 0, 2, 5, 6, 7, 8, 3, 1, 2, 3, 4, 5})
 	f.Add([]byte{1, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 2, 0, 3, 0, 0, 0, 1, 9})
@@ -586,7 +586,7 @@ func FuzzOps(f *testing.F) {
 		stored := map[[4]float32]bool{} // every vector a key was served by: one node each
 		var st searchState
 		for len(ops) >= 6 {
-			op, key, vec := ops[0]%4, uint32(ops[1]%32), fuzzVector(ops[2:6])
+			op, key, vec := ops[0]%5, uint32(ops[1]%32), fuzzVector(ops[2:6])
 			ops = ops[6:]
 			if op == 1 {
 				vec[0] += 1e-6 // usually a near-duplicate of a vector op 0 adds
@@ -665,6 +665,8 @@ func FuzzOps(f *testing.F) {
 				if ix.Stats().BudgetStops == stops && !slices.Equal(got, reachable) {
 					t.Fatalf("distances %v, reachable nearest %v", got, reachable)
 				}
+			case 4:
+				ix = checkRoundTrip(t, ix)
 			}
 			if err := ix.g.verify(); err != nil {
 				t.Fatal(err)
