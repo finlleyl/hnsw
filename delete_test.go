@@ -2,6 +2,7 @@ package hnsw
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"maps"
 	"math"
@@ -552,6 +553,18 @@ func TestTombstones(t *testing.T) {
 				t.Errorf("uniform at ef=10: recall %.4f, %d short results", r, short)
 			}
 		}
+		if err := ix.Compact(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := ix.g.verify(); err != nil {
+			t.Fatal(err)
+		}
+		want = map[string]float64{"uniform": .998, "groups": .93}[mode]
+		r, _ = liveRecall(t, ix, base, queries, k, 100)
+		t.Logf("%s after Compact: recall@10 at ef=100 %.4f", mode, r)
+		if r < want {
+			t.Errorf("%s after Compact: recall %.4f at ef=100, want >= %v", mode, r, want)
+		}
 	}
 }
 
@@ -565,7 +578,7 @@ func fuzzVector(b []byte) []float32 {
 	return v
 }
 
-// FuzzOps runs byte-driven Add, Delete, Search and Save/Load sequences against a map model.
+// FuzzOps runs byte-driven Add, Delete, Search, Save/Load and Compact sequences against a map model.
 func FuzzOps(f *testing.F) {
 	f.Add([]byte{0, 0, 1, 1, 2, 3, 4, 0, 2, 5, 6, 7, 8, 3, 1, 2, 3, 4, 5})
 	f.Add([]byte{1, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 2, 0, 3, 0, 0, 0, 1, 9})
@@ -586,7 +599,7 @@ func FuzzOps(f *testing.F) {
 		stored := map[[4]float32]bool{} // every vector a key was served by: one node each
 		var st searchState
 		for len(ops) >= 6 {
-			op, key, vec := ops[0]%5, uint32(ops[1]%32), fuzzVector(ops[2:6])
+			op, key, vec := ops[0]%6, uint32(ops[1]%32), fuzzVector(ops[2:6])
 			ops = ops[6:]
 			if op == 1 {
 				vec[0] += 1e-6 // usually a near-duplicate of a vector op 0 adds
@@ -667,6 +680,16 @@ func FuzzOps(f *testing.F) {
 				}
 			case 4:
 				ix = checkRoundTrip(t, ix)
+			case 5:
+				if err := ix.Compact(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				stored = map[[4]float32]bool{}
+				for key := range model {
+					served := slices.Clone(ix.g.vec(ix.g.byKey[key]))
+					model[key] = served
+					stored[[4]float32(served)] = true
+				}
 			}
 			if err := ix.g.verify(); err != nil {
 				t.Fatal(err)
