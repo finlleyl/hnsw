@@ -1,7 +1,9 @@
 package hnsw
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"slices"
 	"sync"
 	"testing"
@@ -117,6 +119,26 @@ func TestConcurrentContract(t *testing.T) {
 					return
 				default:
 				}
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			if err := ix.Compact(context.Background()); err != nil {
+				t.Errorf("Compact: %v", err)
+				return
+			}
+			if _, err := ix.WriteTo(io.Discard); err != nil {
+				t.Errorf("WriteTo: %v", err)
+				return
+			}
+			select {
+			case <-done:
+				return
+			default:
 			}
 		}
 	}()
