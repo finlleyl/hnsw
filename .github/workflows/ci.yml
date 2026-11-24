@@ -41,6 +41,18 @@ jobs:
             exit 1
           fi
 
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+      - name: Benchmark smoke test
+        run: go test -timeout=45m -run '^$' -bench . -benchtime=1x -count=1 ./...
+
   build:
     strategy:
       fail-fast: false

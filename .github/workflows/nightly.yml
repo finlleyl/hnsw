@@ -1,0 +1,26 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+      - name: Nightly tests and memory gate
+        run: go test -timeout=60m -count=1 ./...
+      - name: Fuzz operations
+        run: go test -run '^$' -fuzz '^FuzzOps$' -fuzztime=5m
+      - name: Fuzz persistence
+        run: go test -run '^$' -fuzz '^FuzzLoad$' -fuzztime=5m
