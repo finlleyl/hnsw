@@ -71,7 +71,7 @@ type Index[K Key] struct {
 }
 
 // New validates everything up front. dim is fixed for the life of the index, 1..65536.
-// An Index must come from New. On a zero Index, methods that return an error return
+// An Index must come from New or Load. On a zero Index, methods that return an error return
 // ErrInvalidArgument and the others return zero values.
 func New[K Key](dim int, o Options) (*Index[K], error) {
 	if dim < 1 || dim > maxDim {
@@ -241,12 +241,15 @@ func (ix *Index[K]) Contains(key K) bool {
 
 // Keys iterates over the keys. The loop body may call any method. A key not changed
 // during iteration appears exactly once; keys added, deleted or replaced meanwhile may
-// appear, repeat or be missed.
+// appear, repeat or be missed. An iterator running across Compact keeps the old graph
+// in memory until it ends.
 func (ix *Index[K]) Keys() iter.Seq[K] {
 	return func(yield func(K) bool) {
+		ix.mu.RLock()
+		g := ix.g
+		ix.mu.RUnlock()
 		for id := uint32(0); ; id++ {
 			ix.mu.RLock()
-			g := ix.g
 			if g == nil || id >= g.n {
 				ix.mu.RUnlock()
 				return
