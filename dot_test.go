@@ -48,6 +48,14 @@ func TestDotMatchesFloat64Reference(t *testing.T) {
 
 var dotSink float32
 
+func dotScalar(a, b []float32) float32 {
+	var sum float32
+	for i, x := range a {
+		sum += x * b[i]
+	}
+	return sum
+}
+
 func BenchmarkDot(b *testing.B) {
 	s := splitmix(1)
 	for _, d := range []int{128, 768, 1536, 3072} {
@@ -55,10 +63,12 @@ func BenchmarkDot(b *testing.B) {
 		for i := range x {
 			x[i], y[i] = s.signed(), s.signed()
 		}
-		b.Run(fmt.Sprintf("d=%d", d), func(b *testing.B) {
-			for b.Loop() {
-				dotSink = dot(x, y)
-			}
-		})
+		for name, kernel := range map[string]func([]float32, []float32) float32{"scalar": dotScalar, "unrolled8": dot} {
+			b.Run(fmt.Sprintf("%s/d=%d", name, d), func(b *testing.B) {
+				for b.Loop() {
+					dotSink = kernel(x, y)
+				}
+			})
+		}
 	}
 }

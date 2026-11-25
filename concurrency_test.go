@@ -170,6 +170,23 @@ func TestSearchAllocatesOnlyResults(t *testing.T) {
 	}
 }
 
+func BenchmarkReaders(b *testing.B) {
+	configs := []struct {
+		n, d int
+	}{{100000, 128}, {50000, 768}}
+	rates := []struct {
+		name          string
+		addsPerSecond int
+	}{{"no_writer", 0}, {"100_adds", 100}, {"unthrottled", -1}}
+	for _, tc := range configs {
+		for _, rate := range rates {
+			b.Run(fmt.Sprintf("%s/d=%d", rate.name, tc.d), func(b *testing.B) {
+				benchmarkReaders(b, tc.n, tc.d, rate.addsPerSecond, false)
+			})
+		}
+	}
+}
+
 func BenchmarkReaders100Adds(b *testing.B) {
 	configs := []struct {
 		n, d int
@@ -181,87 +198,123 @@ func BenchmarkReaders100Adds(b *testing.B) {
 				mode = "whole"
 			}
 			b.Run(fmt.Sprintf("%s/d=%d", mode, tc.d), func(b *testing.B) {
-				wholeInsert = whole
-				defer func() {
-					wholeInsert = false
-					publishObserver = nil
-				}()
-				const queryCount, adds = 1000, 100
-				all := clustered(tc.n+queryCount+adds*b.N, tc.d, 7)
-				ix, err := New[int](tc.d, Options{M: 16, Seed: 7})
-				if err != nil {
-					b.Fatal(err)
-				}
-				for key := range tc.n {
-					if err := ix.Add(key, all[key]); err != nil {
-						b.Fatal(err)
-					}
-				}
-				var samples []time.Duration
-				var maxPublish time.Duration
-				publishObserver = func(d time.Duration) {
-					if d > maxPublish {
-						maxPublish = d
-					}
-				}
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					stop := make(chan struct{})
-					durations := make(chan time.Duration, 1<<20)
-					var wg sync.WaitGroup
-					for worker := range 8 {
-						wg.Add(1)
-						go func() {
-							defer wg.Done()
-							for j := 0; ; j++ {
-								started := time.Now()
-								_, err := ix.Search(all[tc.n+(worker+j)%queryCount], 10, SearchOptions{})
-								elapsed := time.Since(started)
-								if err != nil {
-									b.Errorf("Search: %v", err)
-									return
-								}
-								select {
-								case durations <- elapsed:
-								case <-stop:
-									return
-								}
-								select {
-								case <-stop:
-									return
-								default:
-								}
-							}
-						}()
-					}
-					started := time.Now()
-					for j := 0; j < adds; j++ {
-						delay := time.Until(started.Add(time.Duration(j) * time.Second / adds))
-						if delay > 0 {
-							time.Sleep(delay)
-						}
-						key := tc.n + i*adds + j
-						if err := ix.Add(key, all[tc.n+queryCount+i*adds+j]); err != nil {
-							b.Errorf("Add: %v", err)
-							break
-						}
-					}
-					close(stop)
-					wg.Wait()
-					close(durations)
-					for d := range durations {
-						samples = append(samples, d)
-					}
-				}
-				b.StopTimer()
-				publishObserver = nil
-				if len(samples) == 0 {
-					b.Fatal("no Search samples")
-				}
-				slices.Sort(samples)
-				b.ReportMetric(float64(samples[len(samples)*99/100]), "search_p99_ns")
-				b.ReportMetric(float64(maxPublish), "publish_max_ns")
+				benchmarkReaders(b, tc.n, tc.d, 100, whole)
 			})
 		}
 	}
+}
+
+func benchmarkReaders(b *testing.B, n, d, addsPerSecond int, whole bool) {
+	b.Helper()
+	wholeInsert = whole
+	defer func() {
+		wholeInsert = false
+		publishObserver = nil
+	}()
+	const queryCount = 1000
+	addsPerIteration := addsPerSecond
+	if addsPerSecond < 0 {
+		addsPerIteration = 32768
+	}
+	all := clustered(n+queryCount+addsPerIteration*b.N, d, 7)
+	ix, err := New[int](d, Options{M: 16, Seed: 7})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for key := range n {
+		if err := ix.Add(key, all[key]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	var samples []time.Duration
+	var maxPublish time.Duration
+	publishObserver = func(d time.Duration) {
+		if d > maxPublish {
+			maxPublish = d
+		}
+	}
+	var elapsed time.Duration
+	totalAdded := 0
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stop := make(chan struct{})
+		durations := make(chan time.Duration, 1<<20)
+		var wg sync.WaitGroup
+		for worker := range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; ; j++ {
+					started := time.Now()
+					_, err := ix.Search(all[n+(worker+j)%queryCount], 10, SearchOptions{})
+					elapsed := time.Since(started)
+					if err != nil {
+						b.Errorf("Search: %v", err)
+						return
+					}
+					select {
+					case durations <- elapsed:
+					case <-stop:
+						return
+					}
+					select {
+					case <-stop:
+						return
+					default:
+					}
+				}
+			}()
+		}
+		started := time.Now()
+		exhausted := false
+		if addsPerSecond == 0 {
+			time.Sleep(time.Second)
+		} else {
+			for j := 0; ; j++ {
+				if addsPerSecond > 0 {
+					if j == addsPerSecond {
+						break
+					}
+					delay := time.Until(started.Add(time.Duration(j) * time.Second / time.Duration(addsPerSecond)))
+					if delay > 0 {
+						time.Sleep(delay)
+					}
+				} else {
+					if j == addsPerIteration {
+						exhausted = true
+						break
+					}
+					if !time.Now().Before(started.Add(time.Second)) {
+						break
+					}
+				}
+				key := n + i*addsPerIteration + j
+				if err := ix.Add(key, all[n+queryCount+i*addsPerIteration+j]); err != nil {
+					b.Errorf("Add: %v", err)
+					break
+				}
+				totalAdded++
+			}
+		}
+		close(stop)
+		wg.Wait()
+		elapsed += time.Since(started)
+		close(durations)
+		for d := range durations {
+			samples = append(samples, d)
+		}
+		if exhausted {
+			b.Error("unthrottled writer exhausted its prepared vectors")
+		}
+	}
+	b.StopTimer()
+	publishObserver = nil
+	if len(samples) == 0 {
+		b.Fatal("no Search samples")
+	}
+	slices.Sort(samples)
+	b.ReportMetric(float64(samples[len(samples)*99/100]), "search_p99_ns")
+	b.ReportMetric(float64(maxPublish), "publish_max_ns")
+	b.ReportMetric(float64(len(samples))/elapsed.Seconds(), "search_qps")
+	b.ReportMetric(float64(totalAdded)/elapsed.Seconds(), "add_qps")
 }
