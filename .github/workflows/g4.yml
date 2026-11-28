@@ -1,0 +1,47 @@
+name: G4 external gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26.2
+          cache: false
+      - name: Record host
+        run: |
+          mkdir -p docs/measurements/gates/data
+          uname -a > docs/measurements/gates/data/g4-host.txt
+          go version >> docs/measurements/gates/data/g4-host.txt
+          go env GOAMD64 >> docs/measurements/gates/data/g4-host.txt
+          lscpu >> docs/measurements/gates/data/g4-host.txt
+      - name: Build measurement binaries
+        working-directory: docs/measurements/gates
+        run: |
+          go build -o g4-stable ./g4
+          go build -modfile=coder-head.mod -o g4-head ./g4
+      - name: Kernel variants
+        working-directory: docs/measurements/gates
+        run: ./g4-stable -mode=kernel > data/g4-kernels.jsonl
+      - name: This index
+        working-directory: docs/measurements/gates
+        run: ./g4-stable -mode=recall -impl=ours > data/g4-ours.jsonl
+      - name: coder/hnsw v0.6.1
+        working-directory: docs/measurements/gates
+        run: ./g4-stable -mode=recall -impl=coder > data/g4-coder-v0.6.1.jsonl
+      - name: coder/hnsw HEAD
+        working-directory: docs/measurements/gates
+        run: ./g4-head -mode=recall -impl=coder > data/g4-coder-head.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g4-results
+          path: docs/measurements/gates/data/g4-*
+          if-no-files-found: error
