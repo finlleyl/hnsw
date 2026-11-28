@@ -2,9 +2,6 @@ name: G4 external gate
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - t9-external-gates
 
 permissions:
   contents: read
