@@ -890,8 +890,8 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ix.g.m != 16 || ix.efc != 200 || ix.ef != 100 {
-		t.Fatalf("M=%d EfConstruction=%d Ef=%d, want 16, 200, 100", ix.g.m, ix.efc, ix.ef)
+	if ix.g.m != 16 || ix.efc != 200 || ix.ef != 320 {
+		t.Fatalf("M=%d EfConstruction=%d Ef=%d, want 16, 200, 320", ix.g.m, ix.efc, ix.ef)
 	}
 }
 

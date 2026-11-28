@@ -41,7 +41,7 @@ type Key interface {
 type Options struct {
 	M              int    // links per node on upper layers, 2M on layer 0. 0 means 16. Range 2..512.
 	EfConstruction int    // build beam. 0 means max(200, M). Range M..65536.
-	Ef             int    // default search beam. 0 means 100. Range 1..65536.
+	Ef             int    // default search beam. 0 means 320. Range 1..65536.
 	Seed           uint64 // level draws; the same seed, GOARCH and insert order give the same graph
 }
 
@@ -90,7 +90,7 @@ func New[K Key](dim int, o Options) (*Index[K], error) {
 		return nil, fmt.Errorf("%w: EfConstruction %d outside %d..%d", ErrInvalidArgument, o.EfConstruction, o.M, maxBeam)
 	}
 	if o.Ef == 0 {
-		o.Ef = 100
+		o.Ef = 320
 	}
 	if o.Ef < 1 || o.Ef > maxBeam {
 		return nil, fmt.Errorf("%w: Ef %d outside 1..%d", ErrInvalidArgument, o.Ef, maxBeam)
