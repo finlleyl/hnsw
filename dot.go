@@ -1,3 +1,5 @@
+//go:build !amd64
+
 package hnsw
 
 // dot returns the dot product of a and b, which must have equal lengths. Separate

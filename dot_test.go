@@ -63,7 +63,7 @@ func BenchmarkDot(b *testing.B) {
 		for i := range x {
 			x[i], y[i] = s.signed(), s.signed()
 		}
-		for name, kernel := range map[string]func([]float32, []float32) float32{"scalar": dotScalar, "unrolled8": dot} {
+		for name, kernel := range map[string]func([]float32, []float32) float32{"scalar": dotScalar, "selected": dot} {
 			b.Run(fmt.Sprintf("%s/d=%d", name, d), func(b *testing.B) {
 				for b.Loop() {
 					dotSink = kernel(x, y)
